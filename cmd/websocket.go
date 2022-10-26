@@ -3,5 +3,5 @@ package main
 import "battleship-server/websocket"
 
 func main() {
-	websocket.Router(":80")
+	websocket.NewRouter(":80")
 }
