@@ -3,40 +3,55 @@ package websocket
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"time"
+
+	"battleship-server/data/serializer"
+	"battleship-server/game"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	CLIENT_BUFFER_SIZE = 1024
+	clientBufferSize = 1024
 	// Time allowed to write a message to the peer.
-	WRITE_WAIT_MAX = 10 * time.Second
+	writeWaitMax = 10 * time.Second
 	// Maximum message size allowed from peer.
-	MAX_MESSAGE_SIZE = 512
+	maxMessagesize = 512
 )
 
-type WsHandler struct {
-	Upgrader   *websocket.Upgrader
-	Serializer Serializer
-	Rooms      map[uint64]*Room
+type wsHandler struct {
+	upgrader   *websocket.Upgrader
+	serializer serializer.Serializer
+	rooms      map[uint64]*room
 }
 
-type Client struct {
-	AccountId   string
-	RoomId      uint64
-	Conn        *websocket.Conn
-	ReadBuffer  chan []byte // buffer to store msg from socket
-	WriteBuffer chan []byte // buffer to write to socket
+type client struct {
+	accountId   string
+	roomId      uint64
+	conn        *websocket.Conn
+	readBuffer  chan []byte // buffer to store msg from socket
+	writeBuffer chan []byte // buffer to write to socket
 }
 
-type Room struct {
-	Clients map[string]*Client
+type room struct {
+	clients map[string]*client
+	game    *game.Game
 }
 
-func (h *WsHandler) establishWsConnection(c *gin.Context) {
+func newWsHandler(serializer serializer.Serializer) *wsHandler {
+	upgrader := &websocket.Upgrader{}
+	upgrader.CheckOrigin = func(r *http.Request) bool { return true } // remove at prod
+	return &wsHandler{
+		upgrader:   upgrader,
+		serializer: serializer,
+		rooms:      map[uint64]*room{},
+	}
+}
+
+func (h *wsHandler) EstablishWsConnection(c *gin.Context) {
 	accessToken := c.Query("access_token")
 	if accessToken == "" {
 		c.AbortWithStatusJSON(400, gin.H{"msg": "invalid_param"})
@@ -48,34 +63,34 @@ func (h *WsHandler) establishWsConnection(c *gin.Context) {
 		return
 	}
 	accountId := accessToken
-
-	if room, exists := h.Rooms[roomId]; exists {
-		if client := room.Clients[accountId]; client != nil {
-			client.Conn.Close()
+	// TODO: need lock
+	if room, exists := h.rooms[roomId]; exists {
+		if client := room.clients[accountId]; client != nil {
+			client.conn.Close()
 		}
 	}
 	// room might have closed, check again, replace with atomic check next time
-	room, exists := h.Rooms[roomId]
+	r, exists := h.rooms[roomId]
 	if !exists {
 		fmt.Println("creating room", roomId)
-		room = &Room{
-			Clients: map[string]*Client{},
+		r = &room{
+			clients: map[string]*client{},
 		}
-		h.Rooms[roomId] = room
+		h.rooms[roomId] = r
 	}
-	conn, err := h.Upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	client := &Client{
-		AccountId:   accountId,
-		RoomId:      roomId,
-		Conn:        conn,
-		WriteBuffer: make(chan []byte, CLIENT_BUFFER_SIZE),
-		ReadBuffer:  make(chan []byte, CLIENT_BUFFER_SIZE),
+	client := &client{
+		accountId:   accountId,
+		roomId:      roomId,
+		conn:        conn,
+		writeBuffer: make(chan []byte, clientBufferSize),
+		readBuffer:  make(chan []byte, clientBufferSize),
 	}
-	room.Clients[accountId] = client
+	r.clients[accountId] = client
 
 	h.handleOnConnect(roomId, accountId)
 	go h.listenClientConnection(client)
@@ -83,56 +98,56 @@ func (h *WsHandler) establishWsConnection(c *gin.Context) {
 	go h.listenClientReadBuffer(client)
 }
 
-func (h *WsHandler) listenClientConnection(client *Client) {
+func (h *wsHandler) listenClientConnection(client *client) {
 	// reading message from conn, then write to READ-buffer
 	defer func() {
-		client.Conn.Close()
-		delete(h.Rooms[client.RoomId].Clients, client.AccountId)
-		close(client.ReadBuffer)
-		close(client.WriteBuffer)
-		h.handleOnDisconnect(client.RoomId, client.AccountId)
-		fmt.Println("ended " + client.AccountId)
-		if len(h.Rooms[client.RoomId].Clients) == 0 {
-			delete(h.Rooms, client.RoomId)
-			fmt.Println("closing room", client.RoomId)
+		client.conn.Close()
+		delete(h.rooms[client.roomId].clients, client.accountId)
+		close(client.readBuffer)
+		close(client.writeBuffer)
+		h.handleOnDisconnect(client.roomId, client.accountId)
+		fmt.Println("ended " + client.accountId)
+		if len(h.rooms[client.roomId].clients) == 0 {
+			delete(h.rooms, client.roomId)
+			fmt.Println("closing room", client.roomId)
 		}
 	}()
-	client.Conn.SetReadLimit(MAX_MESSAGE_SIZE)
+	client.conn.SetReadLimit(maxMessagesize)
 	for {
-		_, b, err := client.Conn.ReadMessage()
+		_, b, err := client.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				fmt.Println(fmt.Sprintf("closed unexpectedly: %+v", err))
 			}
 			break
 		}
-		client.ReadBuffer <- b
+		client.readBuffer <- b
 	}
 }
 
-func (h *WsHandler) listenClientWriteBuffer(client *Client) {
+func (h *wsHandler) listenClientWriteBuffer(client *client) {
 	// reading message from client WRITE-buffer & send message
 	for {
-		b, more := <-client.WriteBuffer
+		b, more := <-client.writeBuffer
 		if !more {
 			break
 		}
 		fmt.Println(fmt.Sprintf("out, payload: %+v", string(b)))
-		client.Conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT_MAX))
-		if err := client.Conn.WriteMessage(websocket.TextMessage, b); err != nil {
-			fmt.Println(fmt.Sprintf("failed to send message from %s, payload: %s, err: %s", client.AccountId, string(b), err))
+		client.conn.SetWriteDeadline(time.Now().Add(writeWaitMax))
+		if err := client.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+			fmt.Println(fmt.Sprintf("failed to send message from %s, payload: %s, err: %s", client.accountId, string(b), err))
 		}
 	}
 }
 
-func (h *WsHandler) listenClientReadBuffer(client *Client) {
+func (h *wsHandler) listenClientReadBuffer(client *client) {
 	// reading message from client READ-buffer
 	// and process accordingly
 	for {
-		b, more := <-client.ReadBuffer
+		b, more := <-client.readBuffer
 		if !more {
 			return
 		}
-		h.handleOnMessage(client.RoomId, client.AccountId, b)
+		h.handleOnMessage(client.roomId, client.accountId, b)
 	}
 }
