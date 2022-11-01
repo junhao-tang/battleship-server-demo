@@ -63,6 +63,11 @@ func (h *wsHandler) EstablishWsConnection(c *gin.Context) {
 		return
 	}
 	accountId := accessToken
+
+	if errMsg := h.canConnect(roomId, accountId); errMsg != "" {
+		c.AbortWithStatusJSON(400, gin.H{"msg": errMsg})
+		return
+	}
 	// TODO: need lock
 	if room, exists := h.rooms[roomId]; exists {
 		if client := room.clients[accountId]; client != nil {

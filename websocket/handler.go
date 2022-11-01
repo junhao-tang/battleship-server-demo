@@ -8,16 +8,35 @@ import (
 )
 
 const maxPlayerCount = 2
+const (
+	errorRoomFull    = "room_full"
+	errorGameStarted = "game_started"
+)
 
 func (h *wsHandler) handleOnDisconnect(roomId uint64, accountId string) {
 	// TODO signal required
+}
+
+func (h *wsHandler) canConnect(roomId uint64, accountId string) string {
+	room := h.rooms[roomId]
+	if room == nil {
+		return ""
+	}
+	if len(room.clients) >= maxPlayerCount {
+		return errorRoomFull
+	}
+	game := room.game
+	if game != nil && !game.PlayerExists(accountId) {
+		return errorGameStarted
+	}
+	return ""
 }
 
 func (h *wsHandler) handleOnConnect(roomId uint64, accountId string) {
 	h.broadcast(roomId, data.NewJoinGameMessage(accountId))
 
 	room := h.rooms[roomId]
-	if len(room.clients) == maxPlayerCount {
+	if room.game == nil && len(room.clients) == maxPlayerCount {
 		playerIds := make([]string, 0, maxPlayerCount)
 		for id := range room.clients {
 			playerIds = append(playerIds, id)

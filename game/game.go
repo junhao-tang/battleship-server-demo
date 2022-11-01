@@ -125,3 +125,12 @@ func (game *Game) GameWidth() int {
 func (game *Game) GameHeight() int {
 	return game.sea[game.playerIds[0]].height
 }
+
+func (game *Game) PlayerExists(playerId string) bool {
+	for _, pid := range game.playerIds {
+		if pid == playerId {
+			return true
+		}
+	}
+	return false
+}
